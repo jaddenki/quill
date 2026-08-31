@@ -107,6 +107,13 @@ enum Config {
         obsidian()?["include_transcript"] as? Bool ?? true
     }
 
+    /// Terminal to open "Chat about meetings" in: "ghostty" or "terminal".
+    /// Unset prefers Ghostty when installed and falls back to Terminal.app.
+    static func terminal() -> String? {
+        guard let value = load()?["terminal"] as? String, !value.isEmpty else { return nil }
+        return value
+    }
+
     /// Absolute path to the `claude` CLI. Nil falls back to a search of the
     /// usual install locations — a LaunchAgent's PATH is too bare to rely on.
     static func claudePath() -> String? {

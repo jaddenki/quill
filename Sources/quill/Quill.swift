@@ -8,7 +8,9 @@ struct Quill: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "quill",
         abstract: "Local meeting recorder + transcriber. Records mic and system audio as two tracks, then transcribes on-device.",
-        subcommands: [Run.self, Doctor.self, Devices.self, Recap.self, Install.self],
+        subcommands: [
+            Run.self, Doctor.self, Devices.self, Recap.self, Chat.self, Install.self,
+        ],
         defaultSubcommand: Run.self
     )
 }
@@ -122,6 +124,17 @@ struct Devices: ParsableCommand {
             print("mic_device \"\(wanted)\"")
         }
         print("pin one with: quill devices --use \"MacBook Pro Microphone\"")
+    }
+}
+
+struct Chat: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Open a Claude Code session in the meeting notes folder."
+    )
+
+    func run() throws {
+        let opened = MainActor.assumeIsolated { MeetingChat.open() }
+        guard opened else { throw ExitCode(1) }
     }
 }
 

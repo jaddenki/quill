@@ -181,7 +181,9 @@ quill recap ~/Recordings/2026.08.27-1009    # re-file, regenerating the recap
 ### Chatting about your meetings
 
 **Chat about meetings** in the menu opens a terminal running `claude` in the
-notes folder. On first export quill drops a `CLAUDE.md` there describing the
+notes folder — [Ghostty](https://ghostty.org) if it's installed, otherwise
+Terminal.app. Set `"terminal": "terminal"` to force the built-in one.
+`quill chat` does the same thing from the shell. On first export quill drops a `CLAUDE.md` there describing the
 note format and the transcripts' failure modes — that `me`/`them` are speaker
 tags rather than names, that proper nouns are the least reliable part of a
 machine transcript — so the session is useful from the first question ("what
@@ -228,6 +230,9 @@ Optional, at `~/.config/quill/config.json`:
   `"sonnet"`. Unset uses the CLI's default.
 - `obsidian.include_transcript` — append the full transcript under the recap
   (default `true`).
+- `terminal` — `"ghostty"` or `"terminal"`, for **Chat about meetings**.
+  Unset prefers Ghostty when it's installed and falls back to Terminal.app,
+  which ships with macOS and so is always there.
 - `claude_path` — absolute path to the `claude` binary. Only needed if it
   isn't in one of the usual locations; a LaunchAgent's `PATH` is too bare to
   search, so quill checks `~/.local/bin`, `~/.claude/local`, and the Homebrew
@@ -247,6 +252,7 @@ quill devices                # list input devices
 quill devices --use <name>   # pin the mic to one
 quill devices --test <secs>  # record from it and report the level
 quill recap <session-dir>    # re-file a session as an Obsidian note
+quill chat                   # open Claude Code in the notes folder
 quill install --launch-at-login
 quill install --uninstall
 ```
