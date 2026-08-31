@@ -38,6 +38,13 @@ final class MicRecorder: @unchecked Sendable {
     private var engine = AVAudioEngine()
     private var file: AVAudioFile?
     private var url: URL?
+    /// The format the file was opened with. A rebuilt engine has to produce
+    /// buffers in exactly this shape to keep appending to the same track.
+    private var clientFormat: AVAudioFormat?
+    private var configObserver: NSObjectProtocol?
+    /// When the graph was last rebuilt, to break feedback loops (see
+    /// `handleConfigurationChange`).
+    private var lastRebuildAt: Date?
     private(set) var isRecording = false
     /// Wall-clock time of the first captured buffer — the track's true start,
     /// used to offset-align the two tracks' transcript timestamps.
@@ -56,17 +63,108 @@ final class MicRecorder: @unchecked Sendable {
         self.url = url
         try attach(voiceProcessing: Config.micVoiceProcessing())
         isRecording = true
+        observeConfigurationChanges()
     }
 
     /// Stop capturing and finalize the file. Idempotent.
     func stop() {
         guard isRecording else { return }
         isRecording = false
+        if let configObserver {
+            NotificationCenter.default.removeObserver(configObserver)
+            self.configObserver = nil
+        }
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
         file = nil
+        clientFormat = nil
     }
 
+
+
+    /// AVAudioEngine tears its graph down whenever the audio hardware
+    /// configuration changes — plugging in headphones mid-meeting is enough.
+    /// Nothing restarts it on its own, so an unhandled notification means the
+    /// mic track silently ends there while the system track keeps going, and
+    /// you don't find out until the transcript has one side of the second half
+    /// of the meeting.
+    ///
+    /// Rebuilding re-applies the pinned device, so a route change can't move
+    /// the recording onto a different microphone either.
+    private func observeConfigurationChanges() {
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleConfigurationChange()
+        }
+    }
+
+    private func handleConfigurationChange() {
+        guard isRecording, clientFormat != nil else { return }
+
+        // Starting and stopping the engine is itself a configuration change,
+        // so a handler that rebuilds unconditionally feeds itself: rebuild →
+        // notification → rebuild, until the track is nothing but teardown and
+        // the file comes out silent. Two guards, because the notification is
+        // delivered asynchronously and a simple in-progress flag is already
+        // clear by the time the echo arrives.
+        //
+        // The first is the real signal: the engine only needs rescuing if the
+        // change actually stopped it. A change it survived needs nothing.
+        guard !engine.isRunning else {
+            FileHandle.standardError.write(Data(
+                "mic: audio configuration changed — engine still running, continuing\n".utf8
+            ))
+            return
+        }
+        // The second is a backstop for any route that stops the engine as part
+        // of its own restart. Rebuilding is cheap but not free, and a rebuild
+        // loop silently destroys the recording — the failure this whole path
+        // exists to prevent.
+        if let lastRebuildAt, Date().timeIntervalSince(lastRebuildAt) < 1 {
+            FileHandle.standardError.write(Data(
+                "mic: configuration changes arriving too fast — not rebuilding again\n".utf8
+            ))
+            return
+        }
+        lastRebuildAt = Date()
+
+        FileHandle.standardError.write(Data(
+            "mic: audio configuration changed — rebuilding graph\n".utf8
+        ))
+
+        // The notification means the old graph is already invalid; the file is
+        // not, so keep writing to it.
+        engine.stop()
+        engine.inputNode.removeTap(onBus: 0)
+
+        do {
+            try attach(voiceProcessing: Config.micVoiceProcessing(), reusingFile: true)
+            // Re-arm: the notification was bound to the engine we just threw away.
+            if let configObserver {
+                NotificationCenter.default.removeObserver(configObserver)
+            }
+            observeConfigurationChanges()
+            FileHandle.standardError.write(Data(
+                "mic: resumed on \(activeDevice?.name ?? "unknown device")\n".utf8
+            ))
+        } catch {
+            // Better a short mic track than a corrupt one: the audio written
+            // so far stays valid and transcribable.
+            FileHandle.standardError.write(Data(
+                ("mic: can't resume after configuration change (\(error)) — "
+                + "mic track ends here, system track continues\n").utf8
+            ))
+            file = nil
+            self.clientFormat = nil
+            notifyUser(
+                title: "quill — microphone dropped out",
+                body: "The mic track ended early. The other side is still recording."
+            )
+        }
+    }
 
     /// The device this recorder actually opened — for the startup log line,
     /// so a silent track can be traced to the wrong microphone.
@@ -87,6 +185,15 @@ final class MicRecorder: @unchecked Sendable {
             FileHandle.standardError.write(Data(
                 "warning: mic device \"\(wanted)\" not connected — using system default\n".utf8
             ))
+            // Loud on purpose. Recording the wrong microphone is only
+            // discoverable after the meeting, when it's too late to redo it —
+            // stderr goes to a log file nobody reads mid-call.
+            notifyUser(
+                title: "quill — recording on the wrong mic",
+                body: "\(wanted) isn't connected. Using "
+                    + (AudioDevices.defaultInput()?.name ?? "the system default")
+                    + " instead."
+            )
             activeDevice = AudioDevices.defaultInput()
             return
         }
@@ -121,7 +228,7 @@ final class MicRecorder: @unchecked Sendable {
     /// Build the engine graph, create the AAC file, and start capture. Called
     /// once at start, and a second time (voiceProcessing: false) if the
     /// liveness check trips.
-    private func attach(voiceProcessing: Bool) throws {
+    private func attach(voiceProcessing: Bool, reusingFile: Bool = false) throws {
         engine = AVAudioEngine()
         let input = engine.inputNode
 
@@ -159,20 +266,31 @@ final class MicRecorder: @unchecked Sendable {
             throw RecorderError.formatUnsupported(inputFormat)
         }
 
-        let settings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: monoFormat.sampleRate,
-            AVNumberOfChannelsKey: 1,
-        ]
-        do {
-            file = try AVAudioFile(
-                forWriting: url!,
-                settings: settings,
-                commonFormat: monoFormat.commonFormat,
-                interleaved: monoFormat.isInterleaved
-            )
-        } catch {
-            throw RecorderError.fileCreationFailed(error)
+        if reusingFile {
+            // Appending to a track already on disk: the rebuilt graph must
+            // deliver the same shape the file was opened with, or every write
+            // fails. A pinned device almost always comes back identical; if it
+            // doesn't, the caller ends the track rather than corrupting it.
+            guard let clientFormat, clientFormat.sampleRate == monoFormat.sampleRate else {
+                throw RecorderError.formatUnsupported(monoFormat)
+            }
+        } else {
+            let settings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: monoFormat.sampleRate,
+                AVNumberOfChannelsKey: 1,
+            ]
+            do {
+                file = try AVAudioFile(
+                    forWriting: url!,
+                    settings: settings,
+                    commonFormat: monoFormat.commonFormat,
+                    interleaved: monoFormat.isInterleaved
+                )
+            } catch {
+                throw RecorderError.fileCreationFailed(error)
+            }
+            clientFormat = monoFormat
         }
 
         if voice {

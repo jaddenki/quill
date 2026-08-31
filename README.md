@@ -94,10 +94,15 @@ quill devices --test 5                          # record 5s and report the peak 
 ```
 
 Or pick it from the menu bar under **Microphone**. The choice is stored as the
-device's Core Audio UID, so it survives renames and re-plugs. If the pinned
-device isn't connected when a recording starts, quill warns and falls back to
-the system default — a meeting recorded on the wrong mic still beats no
-recording.
+device's Core Audio UID, so it survives renames and re-plugs, and it holds for
+the whole session: plugging in headphones mid-meeting doesn't move the
+recording, because the engine is bound to a specific device rather than to
+"whatever is default".
+
+If the pinned device isn't connected when a recording starts, quill posts a
+notification and falls back to the system default — a meeting recorded on the
+wrong mic still beats no recording, but you find out at the start rather than
+afterwards.
 
 `quill devices --test` is the one to run before an important call: it records
 a few seconds through the same path the session will use and tells you whether
@@ -275,3 +280,9 @@ quill install --uninstall
 - `quill devices` lists what Core Audio reports *now*. A Bluetooth headset
   that's paired but asleep won't appear until it connects, which is exactly
   when the fallback warning shows up in the log.
+- Changing audio hardware mid-recording tears down `AVAudioEngine`'s graph.
+  quill rebuilds it and keeps appending to the same track — measured at 7.8s
+  of an 8s recording across a device change, versus 4.0s (the track simply
+  ending) without the handling. Watch out if you touch this: the rebuild is
+  itself a configuration change, so the handler has to ignore its own echo or
+  it loops until the track is silent.
