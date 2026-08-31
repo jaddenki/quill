@@ -4,17 +4,23 @@ import AppKit
 /// a glance and provides the only persistent control surface for the daemon
 /// (since we run as `.accessory` — no dock icon, no main window).
 @MainActor
-final class MenuBarController {
+final class MenuBarController: NSObject {
     private let statusItem: NSStatusItem
     private let stateLabel: NSMenuItem
     private let transcriptionLabel: NSMenuItem
     private let toggleItem: NSMenuItem
 
+    private let micMenu = NSMenu()
+    private let micItem: NSMenuItem
+
     var onToggle: (() -> Void)?
     var onOpenFolder: (() -> Void)?
+    var onOpenChat: (() -> Void)?
     var onQuit: (() -> Void)?
+    /// Device UID, or nil for "follow the system default".
+    var onSelectMic: ((String?) -> Void)?
 
-    init() {
+    override init() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         let menu = NSMenu()
@@ -45,6 +51,19 @@ final class MenuBarController {
         )
         menu.addItem(openFolder)
 
+        let chat = NSMenuItem(
+            title: "Chat about meetings",
+            action: #selector(chatClicked),
+            keyEquivalent: "c"
+        )
+        menu.addItem(chat)
+
+        menu.addItem(.separator())
+
+        micItem = NSMenuItem(title: "Microphone", action: nil, keyEquivalent: "")
+        micItem.submenu = micMenu
+        menu.addItem(micItem)
+
         menu.addItem(.separator())
 
         let quit = NSMenuItem(
@@ -54,10 +73,15 @@ final class MenuBarController {
         )
         menu.addItem(quit)
 
-        for item in [toggleItem, openFolder, quit] {
+        super.init()
+
+        for item in [toggleItem, openFolder, chat, quit] {
             item.target = self
         }
 
+        // Devices come and go while the app runs, so the list is rebuilt each
+        // time the submenu is opened rather than cached at launch.
+        micMenu.delegate = self
         statusItem.menu = menu
 
         if let button = statusItem.button {
@@ -110,5 +134,51 @@ final class MenuBarController {
 
     @objc private func toggleClicked() { onToggle?() }
     @objc private func openFolderClicked() { onOpenFolder?() }
+    @objc private func chatClicked() { onOpenChat?() }
     @objc private func quitClicked() { onQuit?() }
+
+    @objc private func micClicked(_ sender: NSMenuItem) {
+        // representedObject nil is the "System default" row.
+        onSelectMic?(sender.representedObject as? String)
+    }
+}
+
+extension MenuBarController: NSMenuDelegate {
+    /// Rebuild the device list on open. The checkmark marks the configured
+    /// choice; when that device is unplugged, the row it would have checked is
+    /// simply absent and "System default" carries a dash instead — the same
+    /// fallback the recorder makes.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === micMenu else { return }
+        menu.removeAllItems()
+
+        let configured = Config.micDevice()
+        let devices = AudioDevices.inputs()
+        let matched = configured.flatMap { AudioDevices.resolve($0) }
+
+        let systemDefault = NSMenuItem(
+            title: "System default",
+            action: #selector(micClicked(_:)),
+            keyEquivalent: ""
+        )
+        systemDefault.target = self
+        systemDefault.state = configured == nil ? .on : (matched == nil ? .mixed : .off)
+        if configured != nil, matched == nil {
+            systemDefault.title = "System default — \(configured!) not connected"
+        }
+        menu.addItem(systemDefault)
+
+        if !devices.isEmpty { menu.addItem(.separator()) }
+        for device in devices {
+            let item = NSMenuItem(
+                title: device.name,
+                action: #selector(micClicked(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = device.uid
+            item.state = device.id == matched?.id ? .on : .off
+            menu.addItem(item)
+        }
+    }
 }

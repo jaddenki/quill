@@ -1,9 +1,15 @@
 import AVFoundation
+import CoreAudio
 import Foundation
 
-/// Records the default input device to a file via AVAudioEngine, encoding AAC
-/// mono. Buffers stream straight to disk — nothing is held in memory, so
-/// session length is unbounded.
+/// Records an input device to a file via AVAudioEngine, encoding AAC mono.
+/// Buffers stream straight to disk — nothing is held in memory, so session
+/// length is unbounded.
+///
+/// The device is whichever `mic_device` names in config, falling back to the
+/// system default when unset or unplugged. Pinning matters: the system default
+/// follows whatever was connected last, so a headset silently takes over the
+/// meeting the moment it pairs.
 ///
 /// With voice processing on (the default), Apple's echo canceller subtracts
 /// speaker playback from the mic so the system track doesn't bleed into the
@@ -17,12 +23,14 @@ final class MicRecorder: @unchecked Sendable {
         case engineStartFailed(Error)
         case fileCreationFailed(Error)
         case formatUnsupported(AVAudioFormat)
+        case deviceUnavailable(String)
 
         var description: String {
             switch self {
             case .engineStartFailed(let e): return "mic engine start failed: \(e)"
             case .fileCreationFailed(let e): return "mic file creation failed: \(e)"
             case .formatUnsupported(let f): return "can't downmix mic format \(f)"
+            case .deviceUnavailable(let n): return "can't select mic device \(n)"
             }
         }
     }
@@ -59,6 +67,55 @@ final class MicRecorder: @unchecked Sendable {
         file = nil
     }
 
+
+    /// The device this recorder actually opened — for the startup log line,
+    /// so a silent track can be traced to the wrong microphone.
+    private(set) var activeDevice: AudioDevices.Device?
+
+    /// Point the engine's HAL unit at the configured device. Must run after
+    /// `setVoiceProcessingEnabled` (which rebuilds the unit) and before the
+    /// input format is read, since the format belongs to the device.
+    ///
+    /// A configured device that isn't plugged in is a warning, not an error:
+    /// recording the default mic beats not recording the meeting.
+    private func selectConfiguredDevice(on input: AVAudioInputNode) {
+        guard let wanted = Config.micDevice() else {
+            activeDevice = AudioDevices.defaultInput()
+            return
+        }
+        guard let device = AudioDevices.resolve(wanted) else {
+            FileHandle.standardError.write(Data(
+                "warning: mic device \"\(wanted)\" not connected — using system default\n".utf8
+            ))
+            activeDevice = AudioDevices.defaultInput()
+            return
+        }
+        guard let unit = input.audioUnit else {
+            FileHandle.standardError.write(Data(
+                "warning: no input audio unit — using system default mic\n".utf8
+            ))
+            activeDevice = AudioDevices.defaultInput()
+            return
+        }
+        var id = device.id
+        let status = AudioUnitSetProperty(
+            unit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &id,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+        if status == noErr {
+            activeDevice = device
+        } else {
+            FileHandle.standardError.write(Data(
+                "warning: couldn't select \(device.name) (OSStatus \(status)) — using system default\n".utf8
+            ))
+            activeDevice = AudioDevices.defaultInput()
+        }
+    }
+
     // MARK: -
 
     /// Build the engine graph, create the AAC file, and start capture. Called
@@ -84,6 +141,8 @@ final class MicRecorder: @unchecked Sendable {
                 voice = false
             }
         }
+        selectConfiguredDevice(on: input)
+
         let inputFormat = input.outputFormat(forBus: 0)
 
         // One explicit mono client format. With voice processing this is the
@@ -139,7 +198,8 @@ final class MicRecorder: @unchecked Sendable {
             throw RecorderError.engineStartFailed(error)
         }
 
-        let report = "mic: voiceProcessing=\(input.isVoiceProcessingEnabled) "
+        let device = activeDevice?.name ?? "system default"
+        let report = "mic: device=\(device) voiceProcessing=\(input.isVoiceProcessingEnabled) "
             + "input=\(input.outputFormat(forBus: 0)) tap=\(monoFormat)\n"
         FileHandle.standardError.write(Data(report.utf8))
     }

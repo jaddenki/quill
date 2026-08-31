@@ -3,7 +3,8 @@ import Foundation
 /// Post-recording pipeline: a serial queue of session folders to transcribe.
 /// mic.caf → "me", system.caf → "them"; each track's segments are shifted by
 /// its start offset, merged by timestamp, and written as transcript.json
-/// (canonical) plus transcript.md (readable). The filesystem is the queue —
+/// (canonical). With an Obsidian vault configured the readable copy is a
+/// vault note instead of transcript.md. The filesystem is the queue —
 /// `resumePending()` rescans at launch, so a crash or quit mid-transcription
 /// just retries on next run. Failures append to the session's transcribe.log
 /// and never block later jobs.
@@ -11,6 +12,7 @@ actor TranscriptionCoordinator {
     enum Status: Sendable {
         case idle
         case transcribing(session: String, queued: Int)
+        case summarizing(session: String)
         case failed(session: String)
     }
 
@@ -77,7 +79,12 @@ actor TranscriptionCoordinator {
             publish(.transcribing(session: dir.lastPathComponent, queued: queue.count))
             do {
                 try await transcribe(dir)
-                notifyUser(title: "quill — transcript ready", body: dir.lastPathComponent)
+                let note = await file(dir)
+                notifyUser(
+                    title: "quill — transcript ready",
+                    body: note.map { "\(dir.lastPathComponent) → \($0.lastPathComponent)" }
+                        ?? dir.lastPathComponent
+                )
                 runHook(for: dir)
             } catch {
                 log(dir, "transcription failed: \(error)")
@@ -138,6 +145,31 @@ actor TranscriptionCoordinator {
         )
         try transcript.write(to: dir)
         log(dir, "done — \(merged.count) segments")
+    }
+
+    /// File the finished transcript as an Obsidian note. Runs off the actor:
+    /// the recap shells out to `claude` and can take a minute, and blocking
+    /// the actor would stall the menu bar's enqueue calls behind it.
+    ///
+    /// Never throws — a vault that's missing or a recap that fails must not
+    /// cost the session its transcript, which is already safely on disk.
+    private func file(_ dir: URL) async -> URL? {
+        guard ObsidianExporter.isEnabled else { return nil }
+        publish(.summarizing(session: dir.lastPathComponent))
+        return await Task.detached(priority: .utility) { [weak self] in
+            do {
+                return try ObsidianExporter.export(session: dir) { message in
+                    Task { await self?.log(dir, message) }
+                }
+            } catch {
+                Task { await self?.log(dir, "obsidian export failed: \(error)") }
+                notifyUser(
+                    title: "quill — filing failed",
+                    body: "\(dir.lastPathComponent) — see transcribe.log"
+                )
+                return nil
+            }
+        }.value
     }
 
     private func preparedEngine() async throws -> TranscriptionEngine {
@@ -244,14 +276,18 @@ private struct Transcript: Codable {
     let created_at: String
     let segments: [Segment]
 
-    /// Write transcript.json and render transcript.md. Both writes are atomic
-    /// (temp file + rename), so a partially written transcript never exists on
-    /// disk — resumePending treats presence of transcript.json as "done".
+    /// Write transcript.json, plus transcript.md when nothing else renders a
+    /// readable copy. With an Obsidian vault configured the note is that copy,
+    /// so a second one in the recordings folder is just drift waiting to
+    /// happen. Writes are atomic (temp file + rename), so a partially written
+    /// transcript never exists on disk — resumePending treats presence of
+    /// transcript.json as "done".
     func write(to dir: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(self)
             .write(to: dir.appendingPathComponent("transcript.json"), options: .atomic)
+        guard !ObsidianExporter.isEnabled else { return }
         try Data(rendered(title: dir.lastPathComponent).utf8)
             .write(to: dir.appendingPathComponent("transcript.md"), options: .atomic)
     }
